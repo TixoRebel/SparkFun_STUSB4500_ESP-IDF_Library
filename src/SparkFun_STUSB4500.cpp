@@ -18,29 +18,36 @@
   https://github.com/sparkfun/SparkFun_STUSB4500_Arduino_Library/blob/master/LICENSE.md
 */
 
+#include "freertos/FreeRTOS.h"
+#include <string.h>
+
 #include "SparkFun_STUSB4500.h"
 
 uint8_t sector[5][8];
 uint8_t readSectors = 0;
 
-uint8_t STUSB4500::begin(uint8_t deviceAddress, TwoWire &wirePort)
+uint8_t STUSB4500::begin(i2c_master_bus_handle_t bus_handle, uint16_t dev_addr)
 {
   readSectors = 0;
-  _deviceAddress = deviceAddress; //If provided, store the I2C address from user
-  _i2cPort = &wirePort; //Grab which port the user wants us to use
+  this->bus_handle = bus_handle;
+  this->dev_addr = dev_addr;
 
-  _i2cPort->beginTransmission(_deviceAddress);
+  esp_err_t error = i2c_master_probe(bus_handle, dev_addr, 1000);
 
-  uint8_t error = _i2cPort->endTransmission();
-
-  if(error == 0)
+  if(error == ESP_OK)
   {
-	if(readSectors == 0)
+    if(readSectors == 0)
     {
-      read();
-	  readSectors = 1;
+      i2c_device_config_t dev_cfg = {};
+      dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+      dev_cfg.device_address = dev_addr;
+      dev_cfg.scl_speed_hz = 100000;
+
+      error = i2c_master_bus_add_device(bus_handle, &dev_cfg, &(this->dev_handle));
+      if(error == ESP_OK) read();
     }
-	return true; //Device online!
+
+    return true; //Device online!
   }
   else return false;          //Device not attached?
 }
@@ -124,37 +131,37 @@ void STUSB4500::write(uint8_t defaultVals)
 {
   if(defaultVals == 0)
   {
-  	uint8_t nvmCurrent[] = { 0, 0, 0};
-  	float voltage[] = { 0, 0, 0};
+      uint8_t nvmCurrent[] = { 0, 0, 0};
+      float voltage[] = { 0, 0, 0};
 
-  	uint32_t digitalVoltage=0;
+      uint32_t digitalVoltage=0;
 
-  	//Load current values into NVM
-  	for(byte i=0; i<3; i++)
-  	{
-  	  uint32_t pdoData = readPDO(i+1);
-  	  float current = (pdoData&0x3FF)*0.01; //The current is the first 10-bits of the 32-bit PDO register (10mA resolution)
+      //Load current values into NVM
+      for(uint8_t i=0; i<3; i++)
+      {
+        uint32_t pdoData = readPDO(i+1);
+        float current = (pdoData&0x3FF)*0.01; //The current is the first 10-bits of the 32-bit PDO register (10mA resolution)
 
-  	  if(current > 5.0) current = 5.0; //Constrain current value to 5A max
+        if(current > 5.0) current = 5.0; //Constrain current value to 5A max
 
-  	  /*Convert current from float to 4-bit value
+        /*Convert current from float to 4-bit value
        -current from 0.5-3.0A is set in 0.25A steps
        -current from 3.0-5.0A is set in 0.50A steps
       */
-  	  if(current < 0.5)     nvmCurrent[i] = 0;
-  	  else if(current <= 3) nvmCurrent[i] = (4*current)-1;
-  	  else                  nvmCurrent[i] = (2*current)+5;
+        if(current < 0.5)     nvmCurrent[i] = 0;
+        else if(current <= 3) nvmCurrent[i] = (4*current)-1;
+        else                  nvmCurrent[i] = (2*current)+5;
 
 
-  	  digitalVoltage = (pdoData>>10)&0x3FF; //The voltage is bits 10:19 of the 32-bit PDO register
-  	  voltage[i] = digitalVoltage/20.0; //Voltage has 50mV resolution
+        digitalVoltage = (pdoData>>10)&0x3FF; //The voltage is bits 10:19 of the 32-bit PDO register
+        voltage[i] = digitalVoltage/20.0; //Voltage has 50mV resolution
 
-  	  // Make sure the minimum voltage is between 5-20V
-  	  if(voltage[i] < 5.0)       voltage[i] = 5.0;
-  	  else if(voltage[i] > 20.0) voltage[i] = 20.0;
-  	}
+        // Make sure the minimum voltage is between 5-20V
+        if(voltage[i] < 5.0)       voltage[i] = 5.0;
+        else if(voltage[i] > 20.0) voltage[i] = 20.0;
+      }
 
-  	// load current for PDO1 (sector 3, byte 2, bits 4:7)
+      // load current for PDO1 (sector 3, byte 2, bits 4:7)
     sector[3][2] &= 0x0F;             //clear bits 4:7
     sector[3][2] |= (nvmCurrent[0]<<4);    //load new amperage for PDO1
 
@@ -169,13 +176,13 @@ void STUSB4500::write(uint8_t defaultVals)
     // The voltage for PDO1 is 5V and cannot be changed
 
     // PDO2
-	// Load voltage (10-bit)
-	// -bit 9:2 - sector 4, byte 1, bits 0:7
-	// -bit 0:1 - sector 4, byte 0, bits 6:7	
-	digitalVoltage = voltage[1] * 20;          //convert votlage to 10-bit value
-	sector[4][0] &= 0x3F;                        //clear bits 6:7
-	sector[4][0] |= ((digitalVoltage&0x03)<<6);  //load voltage bits 0:1 into bits 6:7
-	sector[4][1] = (digitalVoltage>>2);          //load bits 2:9
+    // Load voltage (10-bit)
+    // -bit 9:2 - sector 4, byte 1, bits 0:7
+    // -bit 0:1 - sector 4, byte 0, bits 6:7    
+    digitalVoltage = voltage[1] * 20;          //convert votlage to 10-bit value
+    sector[4][0] &= 0x3F;                        //clear bits 6:7
+    sector[4][0] |= ((digitalVoltage&0x03)<<6);  //load voltage bits 0:1 into bits 6:7
+    sector[4][1] = (digitalVoltage>>2);          //load bits 2:9
 
     // PDO3
     // Load voltage (10-bit)
@@ -196,7 +203,7 @@ void STUSB4500::write(uint8_t defaultVals)
     sector[3][2] |= (Buffer[0]<<1);
 
 
-	CUST_EnterWriteMode(SECTOR_0 | SECTOR_1  | SECTOR_2 | SECTOR_3  | SECTOR_4 );
+    CUST_EnterWriteMode(SECTOR_0 | SECTOR_1  | SECTOR_2 | SECTOR_3  | SECTOR_4 );
     CUST_WriteSector(0,&sector[0][0]);
     CUST_WriteSector(1,&sector[1][0]);
     CUST_WriteSector(2,&sector[2][0]);
@@ -206,7 +213,7 @@ void STUSB4500::write(uint8_t defaultVals)
   }
   else
   {
-	uint8_t default_sector[5][8] = 
+    uint8_t default_sector[5][8] = 
     {
       {0x00,0x00,0xB0,0xAA,0x00,0x45,0x00,0x00},
       {0x10,0x40,0x9C,0x1C,0xFF,0x01,0x3C,0xDF},
@@ -215,7 +222,7 @@ void STUSB4500::write(uint8_t defaultVals)
       {0x00,0x4B,0x90,0x21,0x43,0x00,0x40,0xFB}
     };
   
-	CUST_EnterWriteMode(SECTOR_0 | SECTOR_1  | SECTOR_2 | SECTOR_3  | SECTOR_4 );
+    CUST_EnterWriteMode(SECTOR_0 | SECTOR_1  | SECTOR_2 | SECTOR_3  | SECTOR_4 );
     CUST_WriteSector(0,&default_sector[0][0]);
     CUST_WriteSector(1,&default_sector[1][0]);
     CUST_WriteSector(2,&default_sector[2][0]);
@@ -250,15 +257,15 @@ uint8_t STUSB4500::getLowerVoltageLimit(uint8_t pdo_numb)
 {  
   if(pdo_numb == 1) //PDO1
   {
-	return 0;
+    return 0;
   }
   else if(pdo_numb == 2) //PDO2
   {
-	return (sector[3][4]>>4) + 5;
+    return (sector[3][4]>>4) + 5;
   }
   else //PDO3
   {
-	return (sector[3][6] & 0x0F) + 5;
+    return (sector[3][6] & 0x0F) + 5;
   }
 }
 
@@ -266,15 +273,15 @@ uint8_t STUSB4500::getUpperVoltageLimit(uint8_t pdo_numb)
 {
   if(pdo_numb == 1) //PDO1
   {
-	return (sector[3][3]>>4) + 5;
+    return (sector[3][3]>>4) + 5;
   }
   else if(pdo_numb == 2) //PDO2
   {
-	return (sector[3][5] & 0x0F) + 5;
+    return (sector[3][5] & 0x0F) + 5;
   }
   else //PDO3
   {
-	return (sector[3][6]>>4) + 5;
+    return (sector[3][6]>>4) + 5;
   }
 }
 
@@ -562,7 +569,7 @@ uint8_t STUSB4500::CUST_EnterWriteMode(unsigned char ErasedSector)
   
   do 
   {
-      delay(500);
+      vTaskDelay(pdMS_TO_TICKS(500));
       if ( I2C_Read_USB_PD(FTP_CTRL_0,Buffer,1) != 0 )return -1; /* Wait for execution */
   }
   while(Buffer[0] & FTP_CUST_REQ); 
@@ -600,7 +607,7 @@ uint8_t STUSB4500::CUST_ExitTestMode(void)
   
   Buffer[0]= FTP_CUST_RST_N;
   Buffer[1]= 0x00;  /* clear registers */
-  if ( I2C_Write_USB_PD(FTP_CTRL_0,Buffer,1) != 0 )return -1;
+  if ( I2C_Write_USB_PD(FTP_CTRL_0,Buffer,2) != 0 )return -1;
   
   Buffer[0]= 0x00;
   if ( I2C_Write_USB_PD(FTP_CUST_PASSWORD_REG,Buffer,1) != 0 )return -1;  /* Clear Password */
@@ -648,33 +655,24 @@ uint8_t STUSB4500::CUST_WriteSector(char SectorNum, unsigned char *SectorData)
   return 0;
 }
 
-uint8_t STUSB4500::I2C_Write_USB_PD(uint16_t Register ,uint8_t *DataW ,uint16_t Length)
+esp_err_t STUSB4500::I2C_Write_USB_PD(uint16_t Register ,uint8_t *DataW ,uint16_t Length)
 {
-  uint8_t error=0;
-  _i2cPort->beginTransmission(_deviceAddress);
-  _i2cPort->write(Register);
-  for(uint8_t i=0;i<Length;i++)
-  {
-    _i2cPort->write(*(DataW+i));
-  }
-  error = _i2cPort->endTransmission();
-  delay(1);
+  static uint8_t buf[STUSB4500_MAX_WRITE_SIZE];
+
+  if (Length >= STUSB4500_MAX_WRITE_SIZE) return ESP_ERR_INVALID_SIZE;
+
+  buf[0] = Register;
+  memcpy(buf + 1, DataW, Length);
+  esp_err_t error = i2c_master_transmit(dev_handle, buf, Length + 1, -1);
+  vTaskDelay(pdMS_TO_TICKS(1));
 
   return error;  
 }
 
-uint8_t STUSB4500::I2C_Read_USB_PD(uint16_t Register ,uint8_t *DataR ,uint16_t Length)
+esp_err_t STUSB4500::I2C_Read_USB_PD(uint16_t Register ,uint8_t *DataR ,uint16_t Length)
 {   
-  _i2cPort->beginTransmission(_deviceAddress);
-  _i2cPort->write(Register);
-  _i2cPort->endTransmission();
-  _i2cPort->requestFrom(_deviceAddress,Length);
-  uint8_t tempData[Length];
-  for(uint16_t i=0;i<Length;i++)
-  {
-    tempData[i] = _i2cPort->read();
-  }
-  memcpy(DataR,tempData,Length);
+  uint8_t reg = Register;
+  esp_err_t error = i2c_master_transmit_receive(dev_handle, &reg, 1, DataR, Length, -1);
   
-  return 0;
+  return error;
 }
